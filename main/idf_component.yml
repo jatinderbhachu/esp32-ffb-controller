@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  espressif/esp_simplefoc: "^1.0.0"
+  espressif/esp_tinyusb: "^1.4.4"
+  espressif/led_strip: "^2.5.5"
+  idf: "^5.0"
+
