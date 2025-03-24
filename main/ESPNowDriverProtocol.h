@@ -29,8 +29,15 @@ enum class CmdType : uint8_t {
   Connect_ack,
   Disconnect,
   Heartbeat,
-  EncoderPos,
+  ControllerState,
   ApplyTorque,
+};
+
+struct ControllerState {
+  float encoder_angle;
+  uint16_t axis1;
+  uint16_t axis2;
+  uint8_t buttons;
 };
 
 enum class EventType { Send, Receive };

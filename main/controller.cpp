@@ -5,7 +5,10 @@
 
 #include "controller.h"
 
+#include "driver/adc.h"
 #include "driver/gpio.h"
+#include "esp_adc_cal.h"
+#include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -38,6 +41,12 @@ static Commander command = Commander(Serial);
 
 static Controller s_controller;
 static QueueHandle_t s_espnow_queue = nullptr;
+
+static adc_oneshot_unit_handle_t s_adc2_handle;
+
+static std::vector<uint8_t> s_recv_buffer;
+static uint32_t s_recv_offset = 0;
+constexpr uint32_t RECV_BUFFER_SIZE = 1024;
 
 // channel A and B callbacks
 void encoderDoA() { encoder.handleA(); }
@@ -83,7 +92,70 @@ void Controller::init_motor() {
   motor.target = 0;
 }
 
+static QueueHandle_t gpio_evt_queue = NULL;
+
+static void IRAM_ATTR gpio_isr_handler(void *arg) {
+  uint32_t gpio_num = (uint32_t)arg;
+  xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+void Controller::run_gpio_task(void *arg) {
+  Controller *controller = static_cast<Controller *>(arg);
+  uint32_t gpio_num;
+  while (true) {
+    if (xQueueReceive(gpio_evt_queue, &gpio_num, portMAX_DELAY)) {
+      int val = gpio_get_level((gpio_num_t)gpio_num);
+      if (val != 0) {
+        controller->m_button_values |= (0x1 << (gpio_num - 4));
+      } else {
+        controller->m_button_values &= ~(0x1 << (gpio_num - 4));
+      }
+    } else {
+      vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
 void Controller::init() {
+
+  // Initialize NVS
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+
+  adc_oneshot_unit_init_cfg_t adc_init_config = {
+      .unit_id = ADC_UNIT_2,
+  };
+  ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc_init_config, &s_adc2_handle));
+
+  adc_oneshot_chan_cfg_t config = {
+      .atten = ADC_ATTEN_DB_12,
+      .bitwidth = ADC_BITWIDTH_DEFAULT,
+  };
+  ESP_ERROR_CHECK(
+      adc_oneshot_config_channel(s_adc2_handle, ADC_CHANNEL_4, &config));
+  ESP_ERROR_CHECK(
+      adc_oneshot_config_channel(s_adc2_handle, ADC_CHANNEL_5, &config));
+
+  gpio_config_t io_conf{
+      .pin_bit_mask = ((1 << 4) | (1 << 5)),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_ENABLE,
+      .intr_type = GPIO_INTR_NEGEDGE,
+  };
+  gpio_config(&io_conf);
+
+  // create a queue to handle gpio event from isr
+  gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+
+  gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
+  gpio_isr_handler_add(GPIO_NUM_4, gpio_isr_handler, (void *)4);
+  gpio_isr_handler_add(GPIO_NUM_5, gpio_isr_handler, (void *)5);
+
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -102,9 +174,13 @@ void Controller::init() {
     ESP_LOGE(TAG, "failed to create espnow queue");
   }
 
+  if (s_recv_buffer.size() < RECV_BUFFER_SIZE) {
+    s_recv_buffer.resize(RECV_BUFFER_SIZE);
+  }
+
   ESP_ERROR_CHECK(esp_now_init());
 
-  // ESP_ERROR_CHECK(esp_now_register_send_cb(this->send_cb));
+  ESP_ERROR_CHECK(esp_now_register_send_cb(this->send_cb));
   ESP_ERROR_CHECK(esp_now_register_recv_cb(this->recv_cb));
 
   ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)ESPNOW_PMK));
@@ -128,18 +204,17 @@ void Controller::recv_cb(const esp_now_recv_info_t *recv_info,
   event.type = EventType::Receive;
   uint8_t *mac_addr = recv_info->src_addr;
 
-  if (mac_addr == NULL) {
-    ESP_LOGE(TAG, "Send cb arg error");
-    return;
-  }
-
   memcpy(event.receive.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-  event.receive.data = (uint8_t *)malloc(len);
+  event.receive.data = &s_recv_buffer[s_recv_offset];
   event.receive.len = len;
   memcpy(event.receive.data, data, len);
 
+  if (s_recv_offset + len > s_recv_buffer.size()) {
+    s_recv_offset = 0;
+  }
+
   if (xQueueSend(s_espnow_queue, &event, ESPNOW_MAXDELAY) != pdTRUE) {
-    ESP_LOGW(TAG, "Send send queue fail");
+    ESP_LOGW(TAG, "espnow recv queue fail");
   }
 }
 
@@ -149,28 +224,30 @@ void Controller::handle_receive_msg(const uint8_t *mac_addr,
   // parse received data
   CmdType cmd_type = (CmdType)data[0];
 
-  // ESP_LOGI(TAG, "handle receive msg %d", (int)cmd_type);
-
   switch (cmd_type) {
   case CmdType::Connect_ack: {
     memcpy(m_receiver_addr.data(), mac_addr, m_receiver_addr.size());
-    ESP_LOGI(TAG, "Connected to %X:%X:%X:%X:%X:%X", mac_addr[0], mac_addr[1],
-             mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-    m_connected = true;
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(esp_now_peer_info_t));
     peer.channel = ESPNOW_CHANNEL;
     peer.ifidx = ESPNOW_WIFI_IF;
     peer.encrypt = false;
 
-    memcpy(peer.peer_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    memcpy(peer.peer_addr, m_receiver_addr.data(), ESP_NOW_ETH_ALEN);
 
     if (!esp_now_is_peer_exist(peer.peer_addr)) {
-      esp_now_add_peer(&peer);
+      esp_err_t err = esp_now_add_peer(&peer);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add peer %s", esp_err_to_name(err));
+      } else {
+        ESP_LOGI(TAG, "Connected to %X:%X:%X:%X:%X:%X", mac_addr[0],
+                 mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4],
+                 mac_addr[5]);
+        m_connected = true;
+      }
     }
   } break;
   case CmdType::ApplyTorque: {
-    // int16_t power = *((int16_t*)&data[1]);
     int16_t power = 0;
     memcpy(&power, &data[1], sizeof(int16_t));
 
@@ -193,8 +270,6 @@ void Controller::run_espnow_task(void *data) {
     case EventType::Receive: {
       controller->handle_receive_msg(event.receive.mac_addr, event.receive.data,
                                      event.receive.len);
-
-      free(event.receive.data);
     } break;
     case EventType::Send: {
     } break;
@@ -214,17 +289,37 @@ static void send_connect_req() {
   }
 }
 
-static void send_pos(const std::array<uint8_t, ESP_NOW_ETH_ALEN> &dst) {
+SemaphoreHandle_t s_espnow_sem = NULL;
+void Controller::send_cb(const uint8_t *mac_addr,
+                         esp_now_send_status_t status) {
+  static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(s_espnow_sem, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken == pdTRUE)
+    taskYIELD();
+}
+
+void Controller::send_state() {
   uint8_t data[ESPNOW_MAX_DATA_SIZE];
   uint32_t len = 0;
-  data[len++] = (uint8_t)CmdType::EncoderPos;
-  float encoder_angle = encoder.getSensorAngle();
-  memcpy(&data[len], &encoder_angle, sizeof(encoder_angle));
-  len += sizeof(int32_t);
+  data[len++] = (uint8_t)CmdType::ControllerState;
 
-  // ESP_LOGI(TAG, "pos %1.2f\n", encoder_angle);
-  if (esp_now_send(dst.data(), &data[0], len) != ESP_OK) {
-    // ESP_LOGE(TAG, "Send pos error\n");
+  adc_oneshot_read(s_adc2_handle, ADC_CHANNEL_4, &m_axis_values[0]);
+  adc_oneshot_read(s_adc2_handle, ADC_CHANNEL_5, &m_axis_values[1]);
+
+  ControllerState state{
+      .encoder_angle = encoder.getSensorAngle(),
+      .axis1 = (uint16_t)m_axis_values[0],
+      .axis2 = (uint16_t)m_axis_values[1],
+      .buttons = m_button_values,
+  };
+  memcpy(&data[len], &state, sizeof(state));
+
+  len += sizeof(state);
+
+  esp_err_t err = esp_now_send(m_receiver_addr.data(), &data[0], len);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to send controller state size %s",
+             esp_err_to_name(err));
   }
 }
 
@@ -248,8 +343,9 @@ void Controller::run_motor_control_task(void *data) {
 
 void Controller::run_controller_task(void *data) {
   Controller *controller = static_cast<Controller *>(data);
-  uint64_t last_pos_time = 0;
-
+  uint64_t last_update_time = 0;
+  s_espnow_sem = xSemaphoreCreateBinary();
+  xSemaphoreGive(s_espnow_sem);
   while (true) {
     if (controller->m_connected == false) {
       send_connect_req();
@@ -257,39 +353,32 @@ void Controller::run_controller_task(void *data) {
       continue;
     }
 
-    // in microseconds
-    constexpr uint64_t pos_interval = 500;
+    if (xSemaphoreTake(s_espnow_sem, portMAX_DELAY) == pdTRUE) {
+      // in microseconds
+      constexpr uint64_t update_interval = 500;
 
-    uint64_t now = esp_timer_get_time();
-    if (now - last_pos_time >= pos_interval) {
-      last_pos_time = now;
-      send_pos(controller->m_receiver_addr);
+      uint64_t now = esp_timer_get_time();
+      if (now - last_update_time >= update_interval) {
+        last_update_time = now;
+        controller->send_state();
+      }
     }
-
-    vTaskDelay(1);
   }
 }
 
 extern "C" void app_main(void) {
-  // Initialize NVS
-  esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ret = nvs_flash_init();
-  }
-
   s_controller.init();
   s_controller.init_motor();
-
-  ESP_ERROR_CHECK(ret);
 
   xTaskCreate(s_controller.run_motor_control_task, "motor_control", 1024 * 8,
               &s_controller, 20, NULL);
 
-  xTaskCreate(s_controller.run_controller_task, "controller", 1024 * 2,
+  xTaskCreate(s_controller.run_controller_task, "controller", 1024 * 4,
               &s_controller, 18, NULL);
 
-  xTaskCreate(s_controller.run_espnow_task, "espnow_recv", 1024 * 8, &s_controller,
-              18, NULL);
+  xTaskCreate(s_controller.run_espnow_task, "espnow_recv", 1024 * 8,
+              &s_controller, 18, NULL);
+
+  xTaskCreate(s_controller.run_gpio_task, "gpio", 1024 * 4, &s_controller, 10,
+              NULL);
 }
